@@ -1,19 +1,14 @@
-from math import remainder
-
-from aiogram.fsm.storage.memory import MemoryStorage
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message
 import asyncio
-import motor.motor_asyncio
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import Command
-
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import logging
+import pytz
 from datetime import datetime, timedelta
 from db import tasks_collection
 
@@ -21,7 +16,8 @@ API_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
+scheduler = AsyncIOScheduler()
+MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -31,14 +27,22 @@ class TaskState(StatesGroup):
     waiting_for_time = State()
     waiting_for_text = State()
 
+
 class TaskCompleteState(StatesGroup):
     waiting_for_task_text = State()
+
 
 class DeleteTaskState(StatesGroup):
     waiting_for_task_text = State()
 
+
 class DeleteDateState(StatesGroup):
     waiting_for_date = State()
+
+
+class EditTask(StatesGroup):
+    waiting_for_old_task = State()
+    waiting_for_new_task = State()
 
 
 @dp.message(Command("add"))
@@ -68,23 +72,28 @@ async def process_time(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("Неверный формат времени. Попробуйте снова (ЧЧ:ММ):")
 
+
 @dp.message(TaskState.waiting_for_text)
 async def process_task_text(message: Message, state: FSMContext):
     user_data = await state.get_data()
 
-    deadline = datetime.combine(user_data["date"], user_data["time"])
+    user_date = user_data["date"]
+    user_time = user_data["time"]
+    user_datetime = datetime.combine(user_date, user_time)
+    local_deadline = MOSCOW_TZ.localize(user_datetime)
 
     task = {
         "user_id": message.from_user.id,
         "task": message.text,
-        "deadline": deadline.isoformat(),
+        "deadline": local_deadline.isoformat(),
         "completed": False
     }
 
     await tasks_collection.insert_one(task)
-    await message.answer(f"✅ Задача добавлена: {message.text} (до {deadline.strftime('%d.%m.%Y %H:%M')})")
+    await message.answer(f"✅ Задача добавлена: {message.text} (до {local_deadline.strftime('%d.%m.%Y %H:%M')})")
 
     await state.clear()
+
 
 @dp.message(Command("tasks"))
 async def list_tasks(message: Message):
@@ -95,17 +104,17 @@ async def list_tasks(message: Message):
         return
 
     response = ""
-    now = datetime.utcnow()
+    now = datetime.now(MOSCOW_TZ)
 
     for task in tasks:
-        deadline = datetime.fromisoformat(task["deadline"])
+        deadline = datetime.fromisoformat(task["deadline"]).astimezone(MOSCOW_TZ)
         time_left = deadline - now
         status = "✅" if task["completed"] else "⏳"
 
         total_seconds = int(time_left.total_seconds())
         days, remainder = divmod(total_seconds, 86400)
         hours, remainder = divmod(remainder, 3600)
-        minutes, seconds =divmod(remainder, 60)
+        minutes, seconds = divmod(remainder, 60)
 
         time_left_str = f"{days} д. {hours} ч. {minutes} м. {seconds} с."
 
@@ -117,10 +126,12 @@ async def list_tasks(message: Message):
 
     await message.answer(response)
 
+
 @dp.message(Command("done"))
 async def start_task_completion(message: Message, state: FSMContext):
     await message.answer("Введите текст задачи, которую хотите отметить как выполненную:")
     await state.set_state(TaskCompleteState.waiting_for_task_text)
+
 
 @dp.message(TaskCompleteState.waiting_for_task_text)
 async def complete_task(message: Message, state: FSMContext):
@@ -137,10 +148,12 @@ async def complete_task(message: Message, state: FSMContext):
 
     await state.clear()
 
+
 @dp.message(Command("delete"))
 async def start_delete_task(message: Message, state: FSMContext):
     await message.answer("Введите текст задачи, которую хотите удалить:")
     await state.set_state(DeleteTaskState.waiting_for_task_text)
+
 
 @dp.message(DeleteTaskState.waiting_for_task_text)
 async def delete_task(message: Message, state: FSMContext):
@@ -178,6 +191,39 @@ async def delete_tasks_by_date(message: Message, state: FSMContext):
     await message.answer(f"🗑 Удалено задач: {result.deleted_count}")
 
     await state.clear()
+
+
+@dp.message(Command("edit"))
+async def start_edit_task(message: Message, state: FSMContext):
+    await message.answer("Введите текст задачи, которую хотите изменить:")
+    await state.set_state(EditTask.waiting_for_old_task)
+
+
+@dp.message(EditTask.waiting_for_old_task)
+async def get_old_task(message: Message, state: FSMContext):
+    task = await tasks_collection.find_one({"user_id": message.from_user.id, "task": message.text})
+    if not task:
+        await message.answer("Задача не найдена. Попробуйте снова.")
+        return
+
+    await state.update_data(old_task=message.text)
+    await message.answer("Введите новый текст для этой задачи:")
+    await state.set_state(EditTask.waiting_for_new_task)
+
+
+@dp.message(EditTask.waiting_for_new_task)
+async def update_task(message: Message, state: FSMContext):
+    data = await state.get_data()
+    old_task = data.get("old_task")
+
+    await tasks_collection.update_one(
+        {"user_id": message.from_user.id, "task": old_task},
+        {"$set": {"task": message.text}}
+    )
+
+    await message.answer(f"✅ Задача обновлена: '{old_task}' → '{message.text}'")
+    await state.clear()
+
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
